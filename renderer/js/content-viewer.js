@@ -32,7 +32,7 @@ export class ContentViewer {
     const result = {};
     for (const [idx, edit] of Object.entries(fileEdits)) {
       if (edit.dirty) {
-        result[idx] = { lines: edit.lines, autostart: edit.autostart, name: edit.name };
+        result[idx] = { lines: edit.lines, autostart: edit.autostart, name: edit.name, editedLineNumbers: edit.editedLineNumbers };
       }
     }
     return result;
@@ -447,9 +447,13 @@ export class ContentViewer {
       this.editedBlocks[filePath] = {};
     }
 
+    // Track which specific line numbers were actually changed
+    const editedLineNumbers = [];
     const isDirty = lines.some((line, idx) => {
       const orig = originalData.lines[idx];
-      return !orig || orig.text !== line.text || orig.lineNumber !== line.lineNumber;
+      const changed = !orig || orig.text !== line.text || orig.lineNumber !== line.lineNumber;
+      if (changed && line.lineNumber) editedLineNumbers.push(line.lineNumber);
+      return changed;
     }) || lines.length !== originalData.lines.length;
 
     this.editedBlocks[filePath][blockIndex] = {
@@ -457,6 +461,7 @@ export class ContentViewer {
       autostart,
       name,
       dirty: isDirty,
+      editedLineNumbers,
     };
 
     if (this.onDirtyChange) {
@@ -616,7 +621,11 @@ export class ContentViewer {
           const savePath = await window.api.showSaveDialog(defaultName);
           if (!savePath) return;
           const saveLines = lines.map(l => ({ lineNumber: l.lineNumber, text: l.text }));
-          const result = await window.api.saveEditedBasic(savePath, progName, saveLines, autostart, basic.variablesBase64);
+          const editedNums = existingEdit?.editedLineNumbers || [];
+          const result = await window.api.saveEditedBasic(
+            savePath, progName, saveLines, autostart,
+            basic.variablesBase64, basic.programBase64, editedNums
+          );
           if (result.error) {
             alert('Error: ' + result.error);
           } else {
@@ -795,9 +804,12 @@ export class ContentViewer {
       this.editedBlocks[filePath] = {};
     }
 
+    const editedLineNumbers = [];
     const isDirty = lines.some((line, idx) => {
       const orig = originalData.lines[idx];
-      return !orig || orig.text !== line.text;
+      const changed = !orig || orig.text !== line.text;
+      if (changed && line.lineNumber) editedLineNumbers.push(line.lineNumber);
+      return changed;
     });
 
     this.editedBlocks[filePath][editKey] = {
@@ -805,6 +817,7 @@ export class ContentViewer {
       autostart,
       name,
       dirty: isDirty,
+      editedLineNumbers,
     };
 
     if (this.onDirtyChange) {

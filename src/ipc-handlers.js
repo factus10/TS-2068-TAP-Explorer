@@ -185,10 +185,14 @@ export function registerIpcHandlers() {
           // Try to extract BASIC program using TS2068 system variables
           const basicInfo = extractBasicFromCapture(content, header.param1);
           if (basicInfo) {
-            // Convert variablesData Buffer to base64 for IPC transfer
+            // Convert Buffer fields to base64 for IPC transfer
             if (basicInfo.variablesData) {
               basicInfo.variablesBase64 = basicInfo.variablesData.toString('base64');
-              delete basicInfo.variablesData; // Don't send raw buffer
+              delete basicInfo.variablesData;
+            }
+            if (basicInfo.programData) {
+              basicInfo.programBase64 = basicInfo.programData.toString('base64');
+              delete basicInfo.programData;
             }
             result.data.basic = basicInfo;
           }
@@ -227,7 +231,16 @@ export function registerIpcHandlers() {
       const buffer = await fs.readFile(originalPath);
       const blocks = parseTapFile(buffer);
 
-      const newTap = rebuildTapFile(buffer, blocks, edits);
+      // Convert editedLineNumbers arrays to Sets for the writer
+      const processedEdits = {};
+      for (const [idx, edit] of Object.entries(edits)) {
+        processedEdits[idx] = {
+          ...edit,
+          editedLineNumbers: edit.editedLineNumbers ? new Set(edit.editedLineNumbers) : null,
+        };
+      }
+
+      const newTap = rebuildTapFile(buffer, blocks, processedEdits, getBlockContent);
       await fs.writeFile(savePath, newTap);
 
       return { success: true, path: savePath, size: newTap.length };
@@ -268,12 +281,13 @@ export function registerIpcHandlers() {
   });
 
   // Save edited BASIC lines as a new TAP file (for state capture editing)
-  // variablesBase64: optional base64-encoded variables data from the state capture
-  ipcMain.handle('save-edited-basic', async (_event, savePath, name, lines, autostart, variablesBase64) => {
+  ipcMain.handle('save-edited-basic', async (_event, savePath, name, lines, autostart, variablesBase64, originalProgramBase64, editedLineNumbers) => {
     try {
       const { buildProgramBlocks } = await import('./tap-writer.js');
       const variablesData = variablesBase64 ? Buffer.from(variablesBase64, 'base64') : null;
-      const { headerBlock, dataBlock } = buildProgramBlocks(name, lines, autostart, variablesData);
+      const originalProgramData = originalProgramBase64 ? Buffer.from(originalProgramBase64, 'base64') : null;
+      const editedSet = editedLineNumbers ? new Set(editedLineNumbers) : null;
+      const { headerBlock, dataBlock } = buildProgramBlocks(name, lines, autostart, variablesData, originalProgramData, editedSet);
       const tapFile = Buffer.concat([headerBlock, dataBlock]);
       await fs.writeFile(savePath, tapFile);
       return { success: true, path: savePath, size: tapFile.length };
@@ -393,6 +407,7 @@ function extractBasicFromCapture(content, baseAddress) {
       programLength: progLen,
       variablesLength: variablesData ? variablesData.length : 0,
       variablesData,
+      programData: Buffer.from(programData), // Original binary for preserving unedited lines
     };
   } catch (err) {
     return null;

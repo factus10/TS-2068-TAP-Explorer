@@ -12,8 +12,8 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.invoke('save-tap-as', originalPath, savePath, edits),
   saveBasicFromCapture: (filePath, blockIndex, savePath) =>
     ipcRenderer.invoke('save-basic-from-capture', filePath, blockIndex, savePath),
-  saveEditedBasic: (savePath, name, lines, autostart, variablesBase64) =>
-    ipcRenderer.invoke('save-edited-basic', savePath, name, lines, autostart, variablesBase64),
+  saveEditedBasic: (savePath, name, lines, autostart, variablesBase64, originalProgramBase64, editedLineNumbers) =>
+    ipcRenderer.invoke('save-edited-basic', savePath, name, lines, autostart, variablesBase64, originalProgramBase64, editedLineNumbers),
   savePng: (savePath, base64Data) =>
     ipcRenderer.invoke('save-png', savePath, base64Data),
   assembleTap: (entries, savePath) =>
