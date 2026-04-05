@@ -3,11 +3,18 @@
  *
  * Converts plain-text BASIC lines back into tokenized binary format
  * suitable for embedding in a TAP file.
+ *
+ * Tokenization algorithm based on zmakebas by Russell Marks / Chris Young:
+ *   https://github.com/chris-y/zmakebas
+ *
+ * The approach:
+ *  1. Create a lowercase copy of the line with quoted strings blanked out
+ *  2. Scan for keywords longest-first, only matching at non-alpha boundaries
+ *  3. Replace matched keywords in-place (so shorter keywords can't match inside)
+ *  4. Output pass: emit token bytes, handle numbers, UDGs, and special chars
  */
 
-// Complete reverse token map: keyword string → byte value
-// Built from the detokenizer's TOKENS table, trimmed of surrounding whitespace.
-// We also include variants with/without surrounding spaces so matching is flexible.
+// Complete reverse token map: keyword string -> byte value
 const KEYWORD_TO_BYTE = {
   'SPECTRUM': 0xa3,
   'PLAY': 0xa4,
@@ -105,210 +112,269 @@ const KEYWORD_TO_BYTE = {
 };
 
 // Keywords sorted by length descending for longest-match-first tokenization.
-// This ensures "GO TO" matches before "GO", "SCREEN$" before "SCREEN", etc.
 const SORTED_KEYWORDS = Object.keys(KEYWORD_TO_BYTE)
   .sort((a, b) => b.length - a.length);
 
+// Infix keywords whose token representation includes surrounding spaces
+// in the detokenizer output (e.g., ' THEN ', ' OR ', ' AND ')
+const INFIX_KEYWORDS = new Set(['OR', 'AND', 'THEN', 'TO', 'STEP', 'LINE']);
+
+function isAlpha(ch) {
+  return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+}
+
 /**
  * Tokenize a single line of BASIC text (without line number).
- * Returns a Buffer of tokenized bytes (including trailing 0x0D).
+ * Uses the zmakebas approach: in-place keyword replacement on a working copy,
+ * then an output pass that emits the final bytes.
  *
  * @param {string} text - The BASIC line text (e.g., 'LET x=5')
  * @returns {Buffer}
  */
 export function tokenizeLine(text) {
-  const bytes = [];
-  let i = 0;
-  let inQuote = false;
-  let afterRem = false;
-  // After LET/FOR/DIM/DEF FN/INPUT, the next word is a variable name, not a keyword.
-  // We suppress keyword matching until we hit '=', '(', ',', ':', or end of line.
-  let inVarName = false;
+  // Phase 1: Create a working copy for keyword matching.
+  // - Prepend a space so boundary checks at position 0 are safe.
+  // - Lowercase for case-insensitive matching.
+  // - Blank out quoted string contents (replace with spaces).
+  const padded = ' ' + text;
+  const chars = Array.from(padded);
+  const work = Array.from(padded.toLowerCase());
 
-  while (i < text.length) {
-    const ch = text[i];
+  // Blank out string contents in the working copy
+  let inStr = false;
+  for (let i = 1; i < work.length; i++) {
+    if (work[i] === '"') {
+      inStr = !inStr;
+    } else if (inStr) {
+      work[i] = ' ';
+    }
+  }
 
-    // In variable name context: emit as literal until we hit a delimiter
-    if (inVarName) {
-      if (ch === '=' || ch === '(' || ch === ')' || ch === ',' || ch === ':' || ch === ';' || ch === ' ') {
-        inVarName = false;
-        // Fall through to normal processing for this character
-      } else {
-        bytes.push(mapCharToByte(ch));
-        i++;
+  // Find REM and blank out everything after it
+  let remPos = -1;
+  for (let i = 1; i < work.length - 2; i++) {
+    if (work[i] === 'r' && work[i + 1] === 'e' && work[i + 2] === 'm' &&
+        !isAlpha(work[i - 1]) && (i + 3 >= work.length || !isAlpha(work[i + 3]))) {
+      remPos = i;
+      for (let j = i + 3; j < work.length; j++) {
+        work[j] = ' ';
+      }
+      break;
+    }
+  }
+
+  // Phase 2: Match and replace keywords in the working copy.
+  // Array to hold token assignments: tokenMap[i] = token byte or 0 (not a token)
+  // We use a parallel array to mark which positions have been consumed by tokens.
+  const tokenMap = new Array(padded.length).fill(0);
+  const consumed = new Array(padded.length).fill(false);
+
+  for (const kw of SORTED_KEYWORDS) {
+    const kwLower = kw.toLowerCase();
+    const kwLen = kw.length;
+
+    // Operator tokens (<=, >=, <>) don't need alpha boundary checks
+    const isOperator = kw === '<=' || kw === '>=' || kw === '<>';
+
+    let searchFrom = 1; // skip the prepended space
+    while (searchFrom < work.length) {
+      const pos = work.join('').indexOf(kwLower, searchFrom);
+      if (pos < 1) break; // not found or at prepended space
+
+      // Check that this position hasn't been consumed by a longer keyword
+      let alreadyConsumed = false;
+      for (let j = pos; j < pos + kwLen; j++) {
+        if (consumed[j]) { alreadyConsumed = true; break; }
+      }
+      if (alreadyConsumed) {
+        searchFrom = pos + 1;
         continue;
       }
-    }
 
-    // Check for [UDG-X] notation anywhere (outside quotes too)
-    const udgMatch = text.substring(i).match(/^\[UDG-([A-U])\]/);
+      const charBefore = work[pos - 1];
+      const charAfter = pos + kwLen < work.length ? work[pos + kwLen] : '';
+
+      let match = false;
+      if (isOperator) {
+        match = true;
+      } else {
+        // zmakebas rule: match only if both adjacent chars are non-alpha
+        match = !isAlpha(charBefore) && !isAlpha(charAfter);
+      }
+
+      // Additional guard: keywords that could be variable names (short words
+      // like OR, TO, IN, AT, LEN, etc.) need stricter checks when used as
+      // variable names in assignment context. On the real Spectrum, the ROM
+      // tokenizer handled this contextually — after LET, FOR, READ, DIM,
+      // the next word was always treated as a variable name.
+      //
+      // We detect assignment context by checking if the keyword is immediately
+      // followed by '=' or preceded by 'LET ' (already tokenized as 0xf1).
+      if (match && kw.length <= 4 && !isOperator) {
+        // Check if this is in a "LET x=" context by scanning back for LET token
+        // LET would have been replaced already (it's longer than most of these)
+        // Look for the pattern: tokenMap has 0xf1 (LET) recently, then spaces/nothing
+        let inLetContext = false;
+        for (let j = pos - 1; j >= 1; j--) {
+          if (work[j] === ' ' || work[j] === '\x01') continue;
+          if (tokenMap[j] === 0xf1 || tokenMap[j] === 0xeb || // LET, FOR
+              tokenMap[j] === 0xe3 || tokenMap[j] === 0xe9) { // READ, DIM
+            inLetContext = true;
+          }
+          break;
+        }
+        // If followed by '=' it's an assignment target (variable name)
+        const realCharAfter = pos + kwLen < padded.length ? padded[pos + kwLen] : '';
+        if (inLetContext) {
+          match = false;
+        }
+        // A keyword followed by an operator is likely a variable used in an
+        // expression, not a function call. Functions are followed by ' ' or '('.
+        // e.g., "len-hl" (variable), "len+1", ";len;" vs "LEN a$" (function)
+        if (match && /[=\-+*/;,)<>]/.test(realCharAfter)) {
+          match = false;
+        }
+        // Infix keywords used as variables: if preceded by an operator or '('
+        // or followed by an operator, it's a variable not a keyword.
+        // e.g., "a(or)", ">or", "*or", "ao<=or"
+        if (match && INFIX_KEYWORDS.has(kw)) {
+          if (/[(*><=]/.test(charBefore)) {
+            match = false;
+          }
+          if (/[)*><=+\-,;]/.test(realCharAfter)) {
+            match = false;
+          }
+        }
+      }
+
+      if (match) {
+        tokenMap[pos] = KEYWORD_TO_BYTE[kw];
+        consumed[pos] = true;
+        for (let j = pos + 1; j < pos + kwLen; j++) {
+          consumed[j] = true;
+          work[j] = '\x01'; // destroy so shorter keywords can't match here
+        }
+        work[pos] = '\x01';
+        searchFrom = pos + kwLen;
+      } else {
+        searchFrom = pos + 1;
+      }
+    }
+  }
+
+  // Phase 3: Output pass. Walk the original text (with prepended space)
+  // and emit bytes.
+  const bytes = [];
+  let i = 1; // skip the prepended space
+
+  while (i < chars.length) {
+    // Check for [UDG-X] notation
+    const remaining = padded.substring(i);
+    const udgMatch = remaining.match(/^\[UDG-([A-U])\]/);
     if (udgMatch) {
-      const udgByte = 0x90 + (udgMatch[1].charCodeAt(0) - 0x41);
-      bytes.push(udgByte);
+      bytes.push(0x90 + (udgMatch[1].charCodeAt(0) - 0x41));
       i += udgMatch[0].length;
       continue;
     }
 
-    // After REM keyword, everything is literal text
-    if (afterRem) {
-      bytes.push(mapCharToByte(ch));
-      i++;
-      continue;
-    }
+    // If this position is a token
+    if (tokenMap[i]) {
+      const tokenByte = tokenMap[i];
+      const kw = Object.keys(KEYWORD_TO_BYTE).find(k => KEYWORD_TO_BYTE[k] === tokenByte);
+      const kwLen = kw ? kw.length : 1;
+      const isInfix = kw && INFIX_KEYWORDS.has(kw);
 
-    // Inside a quoted string, emit raw characters
-    if (inQuote) {
-      // Check for [UDG-X] notation
-      const udgMatch = text.substring(i).match(/^\[UDG-([A-U])\]/);
-      if (udgMatch) {
-        const udgByte = 0x90 + (udgMatch[1].charCodeAt(0) - 0x41);
-        bytes.push(udgByte);
-        i += udgMatch[0].length;
-        continue;
+      // For infix keywords, consume the surrounding spaces.
+      // The detokenizer adds them, so we absorb them from the source.
+      if (isInfix) {
+        // Remove leading space we already emitted
+        if (bytes.length > 0 && bytes[bytes.length - 1] === 0x20) {
+          bytes.pop();
+        }
       }
-      bytes.push(mapCharToByte(ch));
-      if (ch === '"') {
-        inQuote = false;
-      }
-      i++;
-      continue;
-    }
 
-    // Opening quote
-    if (ch === '"') {
-      inQuote = true;
-      bytes.push(0x22);
-      i++;
-      continue;
-    }
+      bytes.push(tokenByte);
+      i += kwLen;
 
-    // Try to match a keyword (case-insensitive, longest first)
-    const remaining = text.substring(i);
-    const upperRemaining = remaining.toUpperCase();
-    let matched = false;
-
-    for (const kw of SORTED_KEYWORDS) {
-      if (upperRemaining.startsWith(kw)) {
-        // Ensure we're not matching a keyword inside a longer identifier.
-        // E.g., don't match "IN" inside "INPUT" - but INPUT is a longer keyword
-        // so it matches first. Edge case: don't match "AT" in "DATA" - but
-        // we check that the character before (if any) isn't a letter.
-        const afterKw = i + kw.length;
-        const charAfter = afterKw < text.length ? text[afterKw] : '';
-        const charBefore = i > 0 ? text[i - 1] : '';
-
-        // For multi-char operator tokens (<=, >=, <>), always match
-        if (kw === '<=' || kw === '>=' || kw === '<>') {
-          bytes.push(KEYWORD_TO_BYTE[kw]);
-          i += kw.length;
-          matched = true;
-          break;
-        }
-
-        // For letter-based keywords, only match at word boundaries.
-        // Check before: don't match if preceded by a letter (e.g., "RAND" matching "AND")
-        if (/[A-Za-z]/.test(charBefore) && !/\s/.test(kw[0])) {
-          continue;
-        }
-        // Check after: don't match if followed by a letter/digit that would
-        // make this part of a variable name (e.g., "IN" inside "INV", "TO" inside "TOT")
-        // Exception: keywords ending in $ (INKEY$, STR$, etc.) are always unambiguous
-        if (/[A-Za-z]/.test(kw[kw.length - 1]) && /[A-Za-z0-9]/.test(charAfter)) {
-          continue;
-        }
-
-        // Infix keywords (OR, AND, THEN, TO, STEP, LINE) are output by the
-        // detokenizer with surrounding spaces (e.g., ' THEN '). The token byte
-        // already encodes these spaces, so consume them from the source text.
-        const INFIX_KEYWORDS = new Set(['OR', 'AND', 'THEN', 'TO', 'STEP', 'LINE']);
-        const isInfix = INFIX_KEYWORDS.has(kw);
-
-        // Infix keywords (OR, AND, TO, etc.) require spaces around them in source.
-        // Without spaces, they're variable names (e.g., "or", "to" as variables).
-        if (isInfix) {
-          // Must be preceded by a space (or start of line)
-          if (i > 0 && charBefore !== ' ') {
-            continue;
-          }
-          // Must be followed by a space (or end of line)
-          if (charAfter !== '' && charAfter !== ' ') {
-            continue;
-          }
-        }
-
-        // Short function keywords (LEN, IN, AT, FN, VAL, etc.) used as variable
-        // names: if followed by an operator like =, +, -, *, /, ), they're likely
-        // variables, not functions. Functions are followed by space or '('.
-        const FUNCTION_KW = new Set(['LEN', 'IN', 'AT', 'FN', 'VAL', 'SGN', 'ABS',
-          'INT', 'SQR', 'SIN', 'COS', 'TAN', 'ASN', 'ACS', 'ATN', 'LN', 'EXP',
-          'NOT', 'BIN', 'PEEK', 'USR', 'CODE', 'STR$', 'CHR$', 'VAL$']);
-        if (FUNCTION_KW.has(kw) && charAfter !== ' ' && charAfter !== '(' && charAfter !== '') {
-          // Followed by an operator — likely a variable name, not a function call
-          if (/[=+\-*/;,)<>]/.test(charAfter)) {
-            continue;
-          }
-        }
-
-        // For infix keywords, consume a leading space if present
-        if (isInfix && i > 0 && text[i - 1] === ' ') {
-          // Remove the trailing space we already emitted as a literal byte
-          if (bytes.length > 0 && bytes[bytes.length - 1] === 0x20) {
-            bytes.pop();
-          }
-        }
-
-        const tokenByte = KEYWORD_TO_BYTE[kw];
-        bytes.push(tokenByte);
-        i += kw.length;
-
-        // Consume trailing space after keyword if present in source
-        if (i < text.length && text[i] === ' ') {
-          if (isInfix) {
-            // Infix: consume trailing space (token includes it)
-            i++;
-          } else {
-            // Regular keyword: consume trailing space (detokenizer adds it)
-            i++;
-          }
-        }
-
-        if (kw === 'REM') {
-          afterRem = true;
-        }
-
-        // After variable-assignment keywords, next word is a variable name
-        if (kw === 'LET' || kw === 'FOR' || kw === 'DIM' || kw === 'DEF FN' || kw === 'READ') {
-          inVarName = true;
-        }
-
-        matched = true;
-        break;
-      }
-    }
-
-    if (matched) continue;
-
-    // Number literal: emit ASCII digits, then 0x0E + 5-byte float
-    if (/[0-9]/.test(ch) || (ch === '.' && i + 1 < text.length && /[0-9]/.test(text[i + 1]))) {
-      const numStart = i;
-      // Consume the number text (digits, decimal point, E notation)
-      let numStr = '';
-      while (i < text.length && /[0-9.eE+\-]/.test(text[i])) {
-        // Be careful with E notation: only consume +/- if preceded by E/e
-        if ((text[i] === '+' || text[i] === '-') && i > numStart &&
-            text[i - 1] !== 'e' && text[i - 1] !== 'E') {
-          break;
-        }
-        numStr += text[i];
+      // Consume trailing space after keyword if present in source
+      // (the detokenizer adds a trailing space for most keywords)
+      if (i < chars.length && chars[i] === ' ') {
         i++;
       }
 
-      // Emit the ASCII representation
+      // After REM, everything is literal
+      if (tokenByte === 0xea) {
+        while (i < chars.length) {
+          const udgRem = padded.substring(i).match(/^\[UDG-([A-U])\]/);
+          if (udgRem) {
+            bytes.push(0x90 + (udgRem[1].charCodeAt(0) - 0x41));
+            i += udgRem[0].length;
+          } else {
+            bytes.push(mapCharToByte(chars[i]));
+            i++;
+          }
+        }
+      }
+
+      continue;
+    }
+
+    // Skip consumed filler bytes (from multi-char keyword replacements)
+    if (consumed[i]) {
+      i++;
+      continue;
+    }
+
+    const ch = chars[i];
+
+    // Quoted strings: emit everything verbatim until closing quote
+    if (ch === '"') {
+      bytes.push(0x22);
+      i++;
+      while (i < chars.length) {
+        const udgStr = padded.substring(i).match(/^\[UDG-([A-U])\]/);
+        if (udgStr) {
+          bytes.push(0x90 + (udgStr[1].charCodeAt(0) - 0x41));
+          i += udgStr[0].length;
+          continue;
+        }
+        bytes.push(mapCharToByte(chars[i]));
+        if (chars[i] === '"') {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    // Number literal: emit ASCII digits, then 0x0E + 5-byte float
+    if (/[0-9]/.test(ch) || (ch === '.' && i + 1 < chars.length && /[0-9]/.test(chars[i + 1]))) {
+      // Don't treat as number if preceded by a letter (it's part of a variable name like a2)
+      const prevCh = i > 1 ? chars[i - 1] : '';
+      if (isAlpha(prevCh) || prevCh === '$') {
+        bytes.push(mapCharToByte(ch));
+        i++;
+        continue;
+      }
+
+      const numStart = i;
+      let numStr = '';
+      while (i < chars.length && /[0-9.eE+\-]/.test(chars[i])) {
+        if ((chars[i] === '+' || chars[i] === '-') && i > numStart &&
+            chars[i - 1] !== 'e' && chars[i - 1] !== 'E') {
+          break;
+        }
+        numStr += chars[i];
+        i++;
+      }
+
+      // Emit ASCII representation
       for (const c of numStr) {
         bytes.push(c.charCodeAt(0));
       }
 
-      // Emit 0x0E + 5-byte floating point
+      // Emit 0x0E + 5-byte float
       const numVal = parseFloat(numStr);
       if (!isNaN(numVal)) {
         bytes.push(0x0e);
@@ -356,7 +422,7 @@ export function tokenizeProgram(lines) {
   const programBuffer = Buffer.concat(parts, totalLen);
   return {
     programBuffer,
-    variablesOffset: totalLen, // No variables in a freshly tokenized program
+    variablesOffset: totalLen,
   };
 }
 
@@ -364,12 +430,12 @@ export function tokenizeProgram(lines) {
  * Map a display character to its ZX Spectrum byte value.
  */
 function mapCharToByte(ch) {
-  if (ch === '\u00A3') return 0x60; // £ → pound sign position
-  if (ch === '\u00A9') return 0x7f; // © → copyright position
-  if (ch === '\u2191') return 0x5e; // ↑ → up arrow (exponentiation)
+  if (ch === '\u00A3') return 0x60; // £
+  if (ch === '\u00A9') return 0x7f; // ©
+  if (ch === '\u2191') return 0x5e; // ↑ (exponentiation)
   const code = ch.charCodeAt(0);
   if (code >= 0x20 && code <= 0x7f) return code;
-  return 0x20; // Unknown chars → space
+  return 0x20;
 }
 
 /**
@@ -379,7 +445,6 @@ function mapCharToByte(ch) {
  * @returns {number[]} 5 bytes
  */
 export function encodeZxFloat(num) {
-  // Special case: zero
   if (num === 0) {
     return [0x00, 0x00, 0x00, 0x00, 0x00];
   }
@@ -395,7 +460,6 @@ export function encodeZxFloat(num) {
   const sign = num < 0 ? 1 : 0;
   let absNum = Math.abs(num);
 
-  // Find exponent: normalize so 0.5 <= mantissa < 1.0
   let exp = 0;
   if (absNum >= 1) {
     while (absNum >= 1) {
@@ -409,26 +473,21 @@ export function encodeZxFloat(num) {
     }
   }
 
-  // Exponent byte is biased by 128 (0x80)
   const expByte = exp + 128;
 
   if (expByte < 0 || expByte > 255) {
-    // Overflow/underflow - return zero
     return [0x00, 0x00, 0x00, 0x00, 0x00];
   }
 
-  // Mantissa: 4 bytes
-  // The leading 1 bit is implicit (replaced by sign bit)
-  let m = absNum * 256; // First mantissa byte
+  let m = absNum * 256;
   const m1 = Math.floor(m);
   m = (m - m1) * 256;
   const m2 = Math.floor(m);
   m = (m - m2) * 256;
   const m3 = Math.floor(m);
   m = (m - m3) * 256;
-  const m4 = Math.floor(m + 0.5); // Round last byte
+  const m4 = Math.floor(m + 0.5);
 
-  // Set sign bit (bit 7 of first mantissa byte) and clear the implied 1 bit
   const byte1 = (m1 & 0x7f) | (sign ? 0x80 : 0x00);
 
   return [expByte, byte1, m2, m3, m4];
