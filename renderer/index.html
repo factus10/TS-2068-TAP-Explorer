@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
+  <title>TS 2068 TAP Explorer</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header id="titlebar">
+    <div class="titlebar-drag"></div>
+    <h1>TS 2068 TAP Explorer</h1>
+    <button id="btn-open-folder" title="Open Folder (Cmd+O)">
+      <span class="icon">&#x1F4C2;</span> Open Folder
+    </button>
+  </header>
+
+  <main id="app">
+    <div id="tree-panel">
+      <div id="tree-toolbar">
+        <span id="current-path" title="">No folder selected</span>
+      </div>
+      <div id="tree-container"></div>
+    </div>
+    <div id="divider"></div>
+    <div id="content-panel">
+      <div id="content-container">
+        <div class="placeholder">
+          <div class="placeholder-icon">&#x1F4FC;</div>
+          <p>Select a TAP file or block to view its contents</p>
+          <p class="placeholder-hint">Use <kbd>Cmd+O</kbd> to open a folder, then expand TAP files to explore their contents.</p>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script src="js/app.js" type="module"></script>
+</body>
+</html>
