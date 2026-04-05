@@ -5,7 +5,10 @@
   "description": "View, edit, and assemble ZX Spectrum / TS 2068 TAP files",
   "type": "module",
   "main": "main.js",
-  "author": "Timex/Sinclair Projects",
+  "author": {
+    "name": "David Anderson",
+    "email": "david@andertone.com"
+  },
   "license": "GPL-3.0",
   "repository": {
     "type": "git",
