@@ -912,6 +912,25 @@ body {
   flex-shrink: 0;
 }
 
+/* ===== Text Viewer ===== */
+.viewer-text {
+  background: var(--bg-primary);
+  border-radius: 8px;
+  padding: 16px;
+  overflow: auto;
+  max-height: 600px;
+}
+
+.viewer-text pre {
+  font-family: "SF Mono", "Courier New", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  margin: 0;
+}
+
 /* Double-click hint cursor */
 .basic-line {
   cursor: text;

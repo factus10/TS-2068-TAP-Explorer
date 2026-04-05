@@ -197,6 +197,9 @@ export class ContentViewer {
         case 'state-capture':
           this.renderStateCapture(result.data, result.label, filePath, blockIndex);
           break;
+        case 'text':
+          this.renderText(result.data);
+          break;
         default:
           this.showError(`Unknown content type: ${result.contentType}`);
       }
@@ -823,6 +826,43 @@ export class ContentViewer {
     if (this.onDirtyChange) {
       this.onDirtyChange(filePath, this.hasEdits(filePath));
     }
+  }
+
+  renderText(data) {
+    const header = document.createElement('div');
+    header.className = 'content-header';
+    header.innerHTML = `
+      <h2>\uD83D\uDCDD Text: "${this.escapeHtml(data.name)}"</h2>
+      <div class="subtitle">${data.encoding} \u2022 ${data.dataLength.toLocaleString()} bytes \u2022 Load address: 0x${data.loadAddress.toString(16).padStart(4, '0').toUpperCase()}</div>
+    `;
+    this.container.appendChild(header);
+
+    // Export button
+    const actions = document.createElement('div');
+    actions.className = 'edit-actions';
+    const exportBtn = document.createElement('button');
+    exportBtn.className = 'save-tap-btn';
+    exportBtn.innerHTML = '\uD83D\uDCBE Export as text\u2026';
+    exportBtn.addEventListener('click', async () => {
+      const defaultName = data.name.replace(/\.[^.]+$/, '') + '.txt';
+      const savePath = await window.api.showSaveDialog(defaultName);
+      if (!savePath) return;
+      // Encode text as base64 for IPC
+      const base64 = btoa(unescape(encodeURIComponent(data.text)));
+      const result = await window.api.savePng(savePath, base64); // reuse the binary save handler
+      if (result.error) alert('Error: ' + result.error);
+      else this.showSaveSuccess(result.path, result.size);
+    });
+    actions.appendChild(exportBtn);
+    this.container.appendChild(actions);
+
+    // Text content
+    const viewer = document.createElement('div');
+    viewer.className = 'viewer-text';
+    const pre = document.createElement('pre');
+    pre.textContent = data.text;
+    viewer.appendChild(pre);
+    this.container.appendChild(viewer);
   }
 
   renderArray(data) {

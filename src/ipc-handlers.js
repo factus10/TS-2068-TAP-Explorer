@@ -120,6 +120,14 @@ export function registerIpcHandlers() {
         case 0: {
           // BASIC program
           const lines = detokenize(content, header.param2);
+          if (lines.length === 0) {
+            // No valid BASIC lines found — likely machine code saved as Program type
+            return {
+              contentType: 'hexdump',
+              data: formatHexDump(content, 0, offset, limit),
+              label: 'Machine code (saved as Program)',
+            };
+          }
           return {
             contentType: 'basic',
             data: {
@@ -162,7 +170,35 @@ export function registerIpcHandlers() {
             }
           }
 
-          // Regular code block - hex dump with base address
+          // Check for word processor text content
+          const textInfo = detectTextContent(content);
+          if (textInfo) {
+            return {
+              contentType: 'text',
+              data: {
+                text: textInfo.text,
+                lineWidth: textInfo.lineWidth,
+                encoding: textInfo.encoding,
+                name: header.name,
+                loadAddress: header.param1,
+                dataLength: content.length,
+              },
+            };
+          }
+
+          // Code block — scrollable hex dump for large blocks, paginated for small
+          if (content.length > 1024) {
+            return {
+              contentType: 'state-capture',
+              data: {
+                base64: content.toString('base64'),
+                baseAddress: header.param1,
+                totalBytes: content.length,
+              },
+              label: `Code: "${header.name}"`,
+            };
+          }
+
           return {
             contentType: 'hexdump',
             data: formatHexDump(content, header.param1, offset, limit),
@@ -417,6 +453,85 @@ function extractBasicFromCapture(content, baseAddress) {
 /**
  * Decode a ZX Spectrum number or character array from a data block.
  */
+/**
+ * Detect if a Code block contains word processor text.
+ * Common patterns: fixed-width lines (32 chars) padded with spaces,
+ * high ratio of printable ASCII characters.
+ *
+ * Known formats:
+ *  - MScript/Tasword: 32-char wide lines at address 0x8200
+ *  - Plain text data files
+ *
+ * @param {Buffer} content
+ * @returns {{ text: string, lineWidth: number, encoding: string }|null}
+ */
+function detectTextContent(content) {
+  if (content.length < 32) return null;
+
+  // Check printability ratio over entire content
+  let printable = 0;
+  for (let i = 0; i < content.length; i++) {
+    const b = content[i];
+    if ((b >= 0x20 && b <= 0x7e) || b === 0x0d || b === 0x0a) printable++;
+  }
+  const ratio = printable / content.length;
+  if (ratio < 0.85) return null;
+
+  // Detect line width: check if content is structured as fixed-width lines.
+  // Try common widths: 32 (MScript/Tasword), 64, 40, 80
+  let lineWidth = 0;
+  for (const w of [32, 64, 40, 80]) {
+    if (content.length % w === 0 && content.length / w >= 2) {
+      // Check if lines end with spaces (padding) or have consistent structure
+      let paddedLines = 0;
+      const numLines = content.length / w;
+      for (let line = 0; line < Math.min(numLines, 20); line++) {
+        const lineEnd = content[line * w + w - 1];
+        if (lineEnd === 0x20) paddedLines++;
+      }
+      if (paddedLines > Math.min(numLines, 20) * 0.5) {
+        lineWidth = w;
+        break;
+      }
+    }
+  }
+
+  // Extract text
+  let text;
+  if (lineWidth > 0) {
+    // Fixed-width: split into lines and trim trailing spaces
+    const lines = [];
+    for (let i = 0; i < content.length; i += lineWidth) {
+      const lineBytes = content.subarray(i, Math.min(i + lineWidth, content.length));
+      let lineStr = '';
+      for (let j = 0; j < lineBytes.length; j++) {
+        const b = lineBytes[j];
+        if (b >= 0x20 && b <= 0x7e) lineStr += String.fromCharCode(b);
+        else if (b === 0x0d || b === 0x0a) lineStr += '\n';
+        else lineStr += ' ';
+      }
+      lines.push(lineStr.trimEnd());
+    }
+    text = lines.join('\n');
+  } else {
+    // Variable-width: just convert bytes to text
+    let str = '';
+    for (let i = 0; i < content.length; i++) {
+      const b = content[i];
+      if (b >= 0x20 && b <= 0x7e) str += String.fromCharCode(b);
+      else if (b === 0x0d || b === 0x0a) str += '\n';
+      else str += ' ';
+    }
+    text = str;
+  }
+
+  return {
+    text,
+    lineWidth: lineWidth || 0,
+    encoding: lineWidth === 32 ? 'MScript/Tasword (32-col)' : lineWidth ? `Fixed ${lineWidth}-col` : 'Plain text',
+  };
+}
+
 function decodeArray(content, type) {
   if (content.length < 3) {
     return { error: 'Array data too short', values: [] };
