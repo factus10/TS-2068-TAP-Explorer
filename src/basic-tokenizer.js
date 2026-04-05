@@ -203,7 +203,10 @@ export function tokenizeLine(text) {
       }
 
       // Immediate guard: followed by '=' means it's a variable assignment target
-      if (match && !isOperator) {
+      // Exception: keywords ending in $ (INKEY$, STR$, CHR$, etc.) are always
+      // unambiguous — they can never be variable names.
+      const endsWithDollar = kw.endsWith('$');
+      if (match && !isOperator && !endsWithDollar) {
         const realCharAfter = pos + kwLen < padded.length ? padded[pos + kwLen] : '';
         if (realCharAfter === '=' && (pos + kwLen + 1 >= padded.length || (padded[pos + kwLen + 1] !== '>' && padded[pos + kwLen + 1] !== '<'))) {
           match = false;
@@ -248,6 +251,8 @@ export function tokenizeLine(text) {
 
     const kw = Object.keys(KEYWORD_TO_BYTE).find(k => KEYWORD_TO_BYTE[k] === tokenByte);
     if (!kw) continue;
+    // Keywords ending in $ are always unambiguous — never variable names
+    if (kw.endsWith('$')) continue;
     const kwLen = kw.length;
 
     // Check: is this keyword preceded by LET/FOR/READ/DIM? → variable name
