@@ -202,46 +202,19 @@ export function tokenizeLine(text) {
         match = !isAlpha(charBefore) && !isAlpha(charAfter);
       }
 
-      // Additional guard: keywords that could be variable names (short words
-      // like OR, TO, IN, AT, LEN, etc.) need stricter checks when used as
-      // variable names in assignment context. On the real Spectrum, the ROM
-      // tokenizer handled this contextually — after LET, FOR, READ, DIM,
-      // the next word was always treated as a variable name.
-      //
-      // We detect assignment context by checking if the keyword is immediately
-      // followed by '=' or preceded by 'LET ' (already tokenized as 0xf1).
-      if (match && kw.length <= 4 && !isOperator) {
-        // Check if this is in a "LET x=" context by scanning back for LET token
-        // LET would have been replaced already (it's longer than most of these)
-        // Look for the pattern: tokenMap has 0xf1 (LET) recently, then spaces/nothing
-        let inLetContext = false;
-        for (let j = pos - 1; j >= 1; j--) {
-          if (work[j] === ' ' || work[j] === '\x01') continue;
-          if (tokenMap[j] === 0xf1 || tokenMap[j] === 0xeb || // LET, FOR
-              tokenMap[j] === 0xe3 || tokenMap[j] === 0xe9) { // READ, DIM
-            inLetContext = true;
-          }
-          break;
-        }
-        // If followed by '=' it's an assignment target (variable name)
+      // Immediate guard: followed by '=' means it's a variable assignment target
+      if (match && !isOperator) {
         const realCharAfter = pos + kwLen < padded.length ? padded[pos + kwLen] : '';
-        if (inLetContext) {
+        if (realCharAfter === '=' && (pos + kwLen + 1 >= padded.length || (padded[pos + kwLen + 1] !== '>' && padded[pos + kwLen + 1] !== '<'))) {
           match = false;
         }
-        // A keyword followed by an operator is likely a variable used in an
-        // expression, not a function call. Functions are followed by ' ' or '('.
-        // e.g., "len-hl" (variable), "len+1", ";len;" vs "LEN a$" (function)
-        if (match && /[=\-+*/;,)<>]/.test(realCharAfter)) {
+        // Followed by arithmetic/punctuation = variable in expression
+        if (match && /[\-+*/;)<>:]/.test(realCharAfter)) {
           match = false;
         }
-        // Infix keywords used as variables: if preceded by an operator or '('
-        // or followed by an operator, it's a variable not a keyword.
-        // e.g., "a(or)", ">or", "*or", "ao<=or"
+        // Infix keywords need space boundaries, not operator chars
         if (match && INFIX_KEYWORDS.has(kw)) {
-          if (/[(*><=]/.test(charBefore)) {
-            match = false;
-          }
-          if (/[)*><=+\-,;]/.test(realCharAfter)) {
+          if (/[(*><=]/.test(charBefore) || /[)*><=+\-,;]/.test(realCharAfter)) {
             match = false;
           }
         }
@@ -258,6 +231,78 @@ export function tokenizeLine(text) {
         searchFrom = pos + kwLen;
       } else {
         searchFrom = pos + 1;
+      }
+    }
+  }
+
+  // Phase 2b: Post-replacement context pass.
+  // Now that ALL keywords are matched, check for context-dependent cases
+  // that need to be un-matched (reverted to variable names).
+  // This handles cases where the context keyword (e.g., USR) was matched
+  // AFTER the variable keyword (e.g., PRINT) due to length-based ordering.
+  for (let pos = 1; pos < tokenMap.length; pos++) {
+    if (!tokenMap[pos]) continue;
+    const tokenByte = tokenMap[pos];
+    // Skip operator tokens
+    if (tokenByte === 0xc7 || tokenByte === 0xc8 || tokenByte === 0xc9) continue;
+
+    const kw = Object.keys(KEYWORD_TO_BYTE).find(k => KEYWORD_TO_BYTE[k] === tokenByte);
+    if (!kw) continue;
+    const kwLen = kw.length;
+
+    // Check: is this keyword preceded by LET/FOR/READ/DIM? → variable name
+    let inLetContext = false;
+    for (let j = pos - 1; j >= 1; j--) {
+      if (tokenMap[j]) {
+        if (tokenMap[j] === 0xf1 || tokenMap[j] === 0xeb || // LET, FOR
+            tokenMap[j] === 0xe3 || tokenMap[j] === 0xe9) { // READ, DIM
+          inLetContext = true;
+        }
+        break;
+      }
+      if (padded[j] === ' ') continue;
+      break;
+    }
+    if (inLetContext) {
+      // Revert: this was a variable name, not a keyword
+      tokenMap[pos] = 0;
+      consumed[pos] = false;
+      for (let j = pos + 1; j < pos + kwLen && j < work.length; j++) {
+        consumed[j] = false;
+      }
+      continue;
+    }
+
+    // Check: keyword used as a value (preceded by USR, PEEK, =, +, etc.)
+    // Scan backwards, skipping spaces and consumed bytes, looking for
+    // the nearest meaningful context.
+    const realCharAfter = pos + kwLen < padded.length ? padded[pos + kwLen] : '';
+    if (realCharAfter === '' || realCharAfter === ':' || realCharAfter === '\n') {
+      let revert = false;
+      for (let j = pos - 1; j >= 1; j--) {
+        if (padded[j] === ' ') continue;
+        if (consumed[j]) {
+          // This position was consumed by a keyword replacement.
+          // Check if it's the START of a token (has a tokenMap entry).
+          if (tokenMap[j]) {
+            if (tokenMap[j] === 0xc0 || tokenMap[j] === 0xbe) { // USR, PEEK
+              revert = true;
+            }
+            break;
+          }
+          // Otherwise it's a filler byte from a multi-char keyword — skip it
+          continue;
+        }
+        // Non-consumed, non-space char
+        if (/[=+\-*/,(]/.test(padded[j])) {
+          revert = true;
+        }
+        break;
+      }
+      if (revert) {
+        tokenMap[pos] = 0;
+        consumed[pos] = false;
+        for (let k = pos + 1; k < pos + kwLen && k < work.length; k++) consumed[k] = false;
       }
     }
   }
