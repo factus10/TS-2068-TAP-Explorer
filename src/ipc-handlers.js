@@ -242,8 +242,8 @@ export function registerIpcHandlers() {
   });
 
   ipcMain.handle('save-tap-dialog', async (_event, defaultName) => {
-    const ext = defaultName.endsWith('.png') ? 'png' : 'tap';
-    const filterName = ext === 'png' ? 'PNG Images' : 'TAP Files';
+    const ext = defaultName.endsWith('.png') ? 'png' : defaultName.endsWith('.txt') ? 'txt' : 'tap';
+    const filterName = ext === 'png' ? 'PNG Images' : ext === 'txt' ? 'Text Files' : 'TAP Files';
     const result = await dialog.showSaveDialog({
       defaultPath: defaultName,
       filters: [{ name: filterName, extensions: [ext] }],
